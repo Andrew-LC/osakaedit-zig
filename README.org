@@ -1,0 +1,3 @@
+#+title: OSAKAEDIT
+
+A reimplementation of the kilo editor written in c.
