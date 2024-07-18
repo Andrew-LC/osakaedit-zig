@@ -55,12 +55,16 @@ const ABuf = struct {
 // Editor Row
 const ERow = struct {
     size: usize,
+    rsize: usize,
     chars: []u8,
+    render: ?*u8,
 
-    pub fn init() ERow {
-        return .{
-            .size = 0,
-            .chars = undefined
+    pub fn init(alloc: Allocator, s: []const u8) !ERow {
+        return ERow{
+            .size = s.len,
+            .rsize = 0,
+            .chars = try alloc.dupe(u8, s),
+            .render = null
         };
     }
 };
@@ -69,23 +73,29 @@ const ERow = struct {
 const EditorConfig = struct {
     cx: usize,
     cy: usize,
+    rowoff: usize,
+    coloff: usize,
     screenrows: usize,
     screencols: usize,
     orig_termios: os.termios,
     abuf: ABuf,
     numrows: usize,
-    erow: ERow,
+    erows: std.ArrayList(ERow),
+    filename: ?[]const u8,
 
     pub fn init(alloc: Allocator) EditorConfig {
         return EditorConfig{
             .cx = 0,
             .cy = 0,
+            .rowoff = 0,
+            .coloff = 0,
             .screenrows = 0,
             .screencols = 0,
             .orig_termios = undefined,
             .abuf = ABuf.init(alloc),
             .numrows = 0,
-            .erow = ERow.init(),
+            .erows = std.ArrayList(ERow).init(alloc),
+            .filename = undefined,
         };
     }
 };
@@ -97,6 +107,7 @@ fn initEditor() !void {
     if (!try getWindowSize(&config.screenrows, &config.screencols)) {
         return error.WindowSizeError;
     }
+    config.screenrows -= 1;
 }
 
 fn enableRawMode() !void {
@@ -117,7 +128,6 @@ fn disableRawMode() void {
         debug.print("Error disabling raw mode: {}\n", .{err});
     };
 }
-
 
 fn getCursorPosition(rows: *usize, cols: *usize) !bool {
     const buf = "\x1b[6n";
@@ -161,45 +171,63 @@ fn getWindowSize(rows: *usize, cols: *usize) !bool {
     }
 }
 
-fn editorOpen(filename: []const u8, alloc: Allocator) !void {
+fn editorAppendRow(s: []const u8) !void {
+    var new_row = try ERow.init(allocator, s);
+    try config.erows.append(new_row);
+    config.numrows += 1;
+}
+
+fn editorOpen(filename: []const u8) !void {
+    config.filename = filename;
     var file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
 
-    var line = try alloc.alloc(u8, 1024);
-    errdefer alloc.free(line);
-
-    const read_result = try file.read(line);
-    var linelen: usize = read_result;
-
-    while (linelen > 0 and (line[linelen - 1] == '\n' or line[linelen - 1] == '\r')) {
-        linelen -= 1;
+    var buffer: [1024]u8 = undefined;
+    while (try file.reader().readUntilDelimiterOrEof(&buffer, '\n')) |line| {
+        try editorAppendRow(line);
     }
-
-    config.erow.size = linelen;
-    config.erow.chars = try std.heap.page_allocator.alloc(u8, linelen + 1);
-    std.mem.copy(u8, config.erow.chars[0..linelen], line[0..linelen]);
-    config.erow.chars[linelen] = 0;
-    config.numrows = 1;
 }
 
 fn editorMoveCursor(key: editorKey) void {
+    const row = if (config.cy < config.numrows) config.erows.items[config.cy] else null;
+
     switch (key) {
         .ARROW_LEFT => {
-            if (config.cx > 0) config.cx -= 1;
+            if (config.cx != 0) {
+                config.cx -= 1;
+            } else if (config.cy > 0) {
+                config.cy -= 1;
+                config.cx = if (config.cy < config.numrows) 
+                    config.erows.items[config.cy].size 
+                else 0;
+            }
         },
         .ARROW_RIGHT => {
-            if (config.cx < config.screencols - 1) config.cx += 1;
+            if (row) |r| {
+                if (config.cx < r.size) {
+                    config.cx += 1;
+                } else if (config.cy < config.numrows - 1) {
+                    config.cy += 1;
+                    config.cx = 0;
+                }
+            }
         },
         .ARROW_UP => {
             if (config.cy > 0) config.cy -= 1;
         },
         .ARROW_DOWN => {
-            if (config.cy < config.screenrows - 1) config.cy += 1;
+            if (config.cy < config.numrows - 1) config.cy += 1;
         },
-        else => {}
+        else => {},
+    }
+
+    // Snap cursor to end of line
+    const newrow = if (config.cy < config.numrows) config.erows.items[config.cy] else null;
+    const rowlen = if (newrow) |r| r.size else 0;
+    if (config.cx > rowlen) {
+        config.cx = rowlen;
     }
 }
-
 
 fn editorReadKey() !u16 {
     var c: [1]u8 = undefined;
@@ -241,15 +269,31 @@ fn editorProcessKeypress() !bool {
     return false;
 }
 
+fn editorScroll() !void {
+    if(config.cy < config.rowoff) {
+        config.rowoff = config.cy;
+    }
+    if (config.cy >= config.rowoff + config.screenrows) {
+        config.rowoff = config.cy - config.screenrows + 1;
+    }
+    if(config.cx < config.coloff) {
+        config.rowoff = config.cy;
+    }
+    if (config.cx >= config.coloff + config.screencols) {
+        config.coloff = config.cx - config.screencols + 1;
+    }
+}
+
 fn editorDrawRows() !void {
     var y: usize = 0;
     while (y < config.screenrows) : (y += 1) {
-        if(y > config.numrows) {
+        var filerow: usize = y + config.rowoff;
+        if (filerow >= config.numrows) {
             if (config.numrows == 0 and y == config.screenrows / 3) {
                 var welcome: [80]u8 = undefined;
                 const welcome_msg = try std.fmt.bufPrint(
                     &welcome,
-                    "KickAss Editor -- version {s}",
+                    "OSAKA Editor -- version {s}",
                     .{kilo_version}
                 );
                 const padding = @max(0, @divFloor(@as(usize, config.screencols) - @as(usize, welcome_msg.len), 2));
@@ -265,29 +309,65 @@ fn editorDrawRows() !void {
                 try config.abuf.abAppend("~");
             }
         } else {
-            var len: usize = config.erow.size;
-            if(len > config.screencols) len = config.screencols;
-            try config.abuf.abAppend(config.erow.chars);
-        } 
+            const row = config.erows.items[filerow];
+            const start = @min(config.coloff, row.size);
+            const available_len = if (row.size > start) row.size - start else 0;
+            const len = @min(available_len, config.screencols);
+            try config.abuf.abAppend(row.chars[start..][0..len]);
+        }
 
         try config.abuf.abAppend("\x1b[K");
-        if (y < config.screenrows - 1) {
-            try config.abuf.abAppend("\r\n");
-        }
+        try config.abuf.abAppend("\r\n");
     }
 }
 
+fn editorDrawStatusBar() !void {
+    _ = try config.abuf.abAppend("\x1b[7m");
+    
+    var status: [80]u8 = undefined;
+    var rstatus: [80]u8 = undefined;
+    const len = std.fmt.bufPrint(
+        &status,
+        "{s:.20} - {} lines",
+        .{
+            if (config.filename) |f| f else "[No Name]",
+            config.numrows
+        }
+    ) catch unreachable;
+    const rlen = std.fmt.bufPrint(
+        &rstatus, // Changed from &status to &rstatus
+        "{}/{}", // Changed format string
+        .{config.cy + 1, config.numrows}
+    ) catch unreachable;
+    const display_len = @min(len.len, config.screencols);
+    _ = try config.abuf.abAppend(status[0..display_len]);
+    
+    var i: usize = display_len;
+    while (i < config.screencols) : (i += 1) {
+        if (config.screencols - i == rlen.len) {
+            _ = try config.abuf.abAppend(rstatus[0..rlen.len]);
+            break;
+        } else {
+            _ = try config.abuf.abAppend(" ");
+        }
+    }
+    _ = try config.abuf.abAppend("\x1b[m");
+}
+
 fn editorRefreshScreen() !void {
+    _ = try editorScroll();
+    
     _ = try config.abuf.abAppend("\x1b[?25l"); // Hide cursor
     _ = try config.abuf.abAppend("\x1b[H");    // Move cursor to top-left corner
 
     try editorDrawRows();
+    try editorDrawStatusBar();
 
     var buff: [32]u8 = undefined;
     const written = try std.fmt.bufPrint(
         &buff,
         "\x1b[{d};{d}H",
-        .{ config.cy + 1, config.cx + 1 }
+        .{ (config.cy - config.rowoff) + 1, (config.cx - config.coloff) + 1 }
     );
     _ = try config.abuf.abAppend(buff[0..written.len]);
 
@@ -299,15 +379,21 @@ fn editorRefreshScreen() !void {
 }
 
 pub fn main() !void {
+    var args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} <filename>\n", .{args[0]});
+        std.os.exit(1);
+    }
+
     try enableRawMode();
     defer disableRawMode();
     try initEditor();
-    try editorOpen("./sample.txt", allocator);
+    try editorOpen(args[1]);
 
     while (true) {
         try editorRefreshScreen();
         if (try editorProcessKeypress()) break;
-
-        std.time.sleep(std.time.ns_per_ms * 10);
     }
 }
