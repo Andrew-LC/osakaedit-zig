@@ -10,15 +10,22 @@ inline fn ctrlKey(comptime k: u8) u8 {
     return k & 0x1f;
 }
 
+const kilo_tab_stop = 12;
+
 const kilo_version = "0.0.1";
 
 const editorKey = enum(u16) {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
     ARROW_DOWN,
     DEL_KEY,
-    _,
+    HOME,
+    END,
+    PAGE_UP,
+    PAGE_DOWN,
+    _
 };
 
 // Allocator
@@ -57,14 +64,14 @@ const ERow = struct {
     size: usize,
     rsize: usize,
     chars: []u8,
-    render: ?*u8,
+    render: []u8,
 
     pub fn init(alloc: Allocator, s: []const u8) !ERow {
         return ERow{
             .size = s.len,
             .rsize = 0,
             .chars = try alloc.dupe(u8, s),
-            .render = null
+            .render = undefined
         };
     }
 };
@@ -73,6 +80,7 @@ const ERow = struct {
 const EditorConfig = struct {
     cx: usize,
     cy: usize,
+    rx: usize,
     rowoff: usize,
     coloff: usize,
     screenrows: usize,
@@ -87,6 +95,7 @@ const EditorConfig = struct {
         return EditorConfig{
             .cx = 0,
             .cy = 0,
+            .rx = 0,
             .rowoff = 0,
             .coloff = 0,
             .screenrows = 0,
@@ -171,9 +180,48 @@ fn getWindowSize(rows: *usize, cols: *usize) !bool {
     }
 }
 
+fn editorRowCxToRx(row: *const ERow, cx: usize) usize {
+    var rx: usize = 0;
+    for (row.chars[0..cx]) |char| {
+        if (char == '\t') {
+            rx += (kilo_tab_stop - 1) - (rx % kilo_tab_stop);
+        }
+        rx += 1;
+    }
+    return rx;
+}
+
+fn editorUpdateRow(row: *ERow) !void {
+    var tabs: usize = 0;
+    for (row.chars) |char| {
+        if (char == '\t') tabs += 1;
+    }
+    
+    row.render = try allocator.alloc(u8, row.size + tabs * (kilo_tab_stop));
+    
+    var idx: usize = 0;
+    for (row.chars) |char| {
+        if (char == '\t') {
+            row.render[idx] = ' ';
+            idx += 1;
+            while (idx % kilo_tab_stop != 0) {
+                if (idx >= row.render.len) break;
+                row.render[idx] = ' ';
+                idx += 1;
+            }
+        } else {
+            if (idx >= row.render.len) break;
+            row.render[idx] = char;
+            idx += 1;
+        }
+    } 
+    row.rsize = idx;
+}
+
 fn editorAppendRow(s: []const u8) !void {
     var new_row = try ERow.init(allocator, s);
     try config.erows.append(new_row);
+    try editorUpdateRow(&config.erows.items[config.erows.items.len - 1]);
     config.numrows += 1;
 }
 
@@ -188,6 +236,32 @@ fn editorOpen(filename: []const u8) !void {
     }
 }
 
+fn editorRowInsertChar(row: *ERow, at: usize, c: u8) !void {
+    if (at > row.size) return;
+    
+    const new_chars = try allocator.alloc(u8, row.size + 1);
+    defer allocator.free(row.chars); // Free the old buffer
+
+    @memcpy(new_chars[0..at], row.chars[0..at]);
+    new_chars[at] = c;
+    @memcpy(new_chars[at+1..], row.chars[at..]);
+
+    row.chars = new_chars;
+    row.size += 1;
+    try editorUpdateRow(row);
+}
+
+fn editorInsertChar(c: u16) !void {
+    if (config.cy == config.numrows) {
+        try editorAppendRow(&[_]u8{});
+    }
+    
+    const char: u8 = @truncate(c);
+    
+    try editorRowInsertChar(&config.erows.items[config.cy], config.cx, char);
+    config.cx += 1;
+}
+
 fn editorMoveCursor(key: editorKey) void {
     const row = if (config.cy < config.numrows) config.erows.items[config.cy] else null;
 
@@ -197,9 +271,7 @@ fn editorMoveCursor(key: editorKey) void {
                 config.cx -= 1;
             } else if (config.cy > 0) {
                 config.cy -= 1;
-                config.cx = if (config.cy < config.numrows) 
-                    config.erows.items[config.cy].size 
-                else 0;
+                config.cx= config.erows.items[config.cy].size;
             }
         },
         .ARROW_RIGHT => {
@@ -256,31 +328,46 @@ fn editorReadKey() !u16 {
     }
 }
 
+
 fn editorProcessKeypress() !bool {
     const c = try editorReadKey();
     if (c == ctrlKey('q')) return true;
+    if (c == ctrlKey('l')) return true;
+    std.debug.print("Read key: {}\n", .{c});
+
 
     switch (@as(editorKey, @enumFromInt(c))) {
         .ARROW_UP, .ARROW_DOWN, .ARROW_RIGHT, .ARROW_LEFT => |key| {
             editorMoveCursor(key);
         },
-        else => {},
+        .BACKSPACE => {
+            
+        },
+        else => {
+            _ = try editorInsertChar(c);
+        },
     }
     return false;
 }
 
+
 fn editorScroll() !void {
+    config.rx = 0;
+    if (config.cy < config.numrows) {
+        config.rx = editorRowCxToRx(&config.erows.items[config.cy], config.cx);
+    }
+    
     if(config.cy < config.rowoff) {
         config.rowoff = config.cy;
     }
     if (config.cy >= config.rowoff + config.screenrows) {
         config.rowoff = config.cy - config.screenrows + 1;
     }
-    if(config.cx < config.coloff) {
-        config.rowoff = config.cy;
+    if(config.rx < config.coloff) {
+        config.coloff = config.rx;
     }
-    if (config.cx >= config.coloff + config.screencols) {
-        config.coloff = config.cx - config.screencols + 1;
+    if (config.rx >= config.coloff + config.screencols) {
+        config.coloff = config.rx - config.screencols + 1;
     }
 }
 
@@ -309,11 +396,12 @@ fn editorDrawRows() !void {
                 try config.abuf.abAppend("~");
             }
         } else {
-            const row = config.erows.items[filerow];
-            const start = @min(config.coloff, row.size);
-            const available_len = if (row.size > start) row.size - start else 0;
-            const len = @min(available_len, config.screencols);
-            try config.abuf.abAppend(row.chars[start..][0..len]);
+            const row = &config.erows.items[filerow];
+            var len: usize = if (row.rsize > config.coloff) row.rsize - config.coloff else 0;
+            if (len > config.screencols) len = config.screencols;
+            if (len > 0) {
+                try config.abuf.abAppend(row.render[config.coloff..][0..len]);
+            }
         }
 
         try config.abuf.abAppend("\x1b[K");
@@ -328,7 +416,7 @@ fn editorDrawStatusBar() !void {
     var rstatus: [80]u8 = undefined;
     const len = std.fmt.bufPrint(
         &status,
-        "{s:.20} - {} lines",
+        "{s:.20} - {} lines | kevin's a fatty btw",
         .{
             if (config.filename) |f| f else "[No Name]",
             config.numrows
@@ -367,7 +455,7 @@ fn editorRefreshScreen() !void {
     const written = try std.fmt.bufPrint(
         &buff,
         "\x1b[{d};{d}H",
-        .{ (config.cy - config.rowoff) + 1, (config.cx - config.coloff) + 1 }
+        .{ (config.cy - config.rowoff) + 1, (config.rx - config.coloff) + 1 }
     );
     _ = try config.abuf.abAppend(buff[0..written.len]);
 
