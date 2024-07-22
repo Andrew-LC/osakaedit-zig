@@ -1,4 +1,3 @@
-
 A reimplementation of the kilo editor written in c.
 
 ## TODOS:
