@@ -25,6 +25,7 @@ const editorKey = enum(u16) {
     END,
     PAGE_UP,
     PAGE_DOWN,
+    RETURN_KEY,
     _
 };
 
@@ -32,7 +33,7 @@ const editorKey = enum(u16) {
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
 
-// Single Buffer update for writes
+// // Single Buffer update for writes
 const ABuf = struct {
     b: []u8,
     len: usize,
@@ -220,9 +221,46 @@ fn editorUpdateRow(row: *ERow) !void {
 
 fn editorAppendRow(s: []const u8) !void {
     var new_row = try ERow.init(allocator, s);
+    new_row.size = s.len;
     try config.erows.append(new_row);
     try editorUpdateRow(&config.erows.items[config.erows.items.len - 1]);
     config.numrows += 1;
+}
+
+
+fn editorRowsToString() ![]u8 {
+    var tolen: usize = 0;
+    for (config.erows.items) |row| {
+        tolen += row.size + 1; 
+    }
+    var buffer = try allocator.alloc(u8, tolen);
+
+    var offset: usize = 0;
+    for (config.erows.items) |row| {
+        std.mem.copy(u8, buffer[offset..], row.chars[0..row.size]);
+        offset += row.size;
+        buffer[offset] = '\n';
+        offset += 1;
+    }
+
+    return buffer;
+}
+
+fn editorSave() !void {
+    if (config.filename == null) {
+        return;
+    }
+
+    var buffer = try editorRowsToString();
+    defer allocator.free(buffer);
+
+    const file = try std.fs.cwd().createFile(config.filename.?, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close();
+
+    try file.writeAll(buffer);
 }
 
 fn editorOpen(filename: []const u8) !void {
@@ -237,29 +275,32 @@ fn editorOpen(filename: []const u8) !void {
 }
 
 fn editorRowInsertChar(row: *ERow, at: usize, c: u8) !void {
-    if (at > row.size) return;
+    var insert_at = if (at > row.size) row.size else at;
     
-    const new_chars = try allocator.alloc(u8, row.size + 1);
-    defer allocator.free(row.chars); // Free the old buffer
-
-    @memcpy(new_chars[0..at], row.chars[0..at]);
-    new_chars[at] = c;
-    @memcpy(new_chars[at+1..], row.chars[at..]);
-
+    const new_chars = try allocator.realloc(row.chars, row.size + 1);
     row.chars = new_chars;
+
+    if (insert_at < row.size) {
+        std.mem.copyBackwards(u8, row.chars[insert_at+1..row.size+1], row.chars[insert_at..row.size]);
+    }
+    row.chars[insert_at] = c;
     row.size += 1;
     try editorUpdateRow(row);
 }
 
-fn editorInsertChar(c: u16) !void {
+fn editorInsertChar(c: u21) !void {
     if (config.cy == config.numrows) {
-        try editorAppendRow(&[_]u8{});
+        try editorAppendRow("");
     }
     
-    const char: u8 = @truncate(c);
-    
-    try editorRowInsertChar(&config.erows.items[config.cy], config.cx, char);
-    config.cx += 1;
+    if (c <= 0x7F) {
+        const char: u8 = @intCast(c);
+        try editorRowInsertChar(&config.erows.items[config.cy], config.cx, char);
+        config.cx += 1;
+    } else {
+        // Handle Unicode characters (you might want to implement this)
+        // For now, we'll just ignore them
+    }
 }
 
 fn editorMoveCursor(key: editorKey) void {
@@ -307,22 +348,47 @@ fn editorReadKey() !u16 {
         const nread = try os.read(os.STDIN_FILENO, &c);
         if (nread == 1) {
             if (c[0] == '\x1b') {
-                var seq: [2]u8 = undefined;
+                var seq: [3]u8 = undefined;
                 if (try os.read(os.STDIN_FILENO, seq[0..1]) != 1) return '\x1b';
                 if (try os.read(os.STDIN_FILENO, seq[1..2]) != 1) return '\x1b';
 
                 if (seq[0] == '[') {
-                    switch (seq[1]) {
-                        'A' => return @intFromEnum(editorKey.ARROW_UP),
-                        'B' => return @intFromEnum(editorKey.ARROW_DOWN),
-                        'C' => return @intFromEnum(editorKey.ARROW_RIGHT),
-                        'D' => return @intFromEnum(editorKey.ARROW_LEFT),
-                        else => return '\x1b',
+                    if (seq[1] >= '0' and seq[1] <= '9') {
+                        if (try os.read(os.STDIN_FILENO, seq[2..3]) != 1) return '\x1b';
+                        if (seq[2] == '~') {
+                            return switch (seq[1]) {
+                                '1', '7' => @intFromEnum(editorKey.HOME),
+                                '3' => @intFromEnum(editorKey.DEL_KEY),
+                                '4', '8' => @intFromEnum(editorKey.END),
+                                '5' => @intFromEnum(editorKey.PAGE_UP),
+                                '6' => @intFromEnum(editorKey.PAGE_DOWN),
+                                else => '\x1b',
+                            };
+                        }
+                    } else {
+                        return switch (seq[1]) {
+                            'A' => @intFromEnum(editorKey.ARROW_UP),
+                            'B' => @intFromEnum(editorKey.ARROW_DOWN),
+                            'C' => @intFromEnum(editorKey.ARROW_RIGHT),
+                            'D' => @intFromEnum(editorKey.ARROW_LEFT),
+                            'H' => @intFromEnum(editorKey.HOME),
+                            'F' => @intFromEnum(editorKey.END),
+                            else => '\x1b',
+                        };
                     }
+                } else if (seq[0] == 'O') {
+                    return switch (seq[1]) {
+                        'H' => @intFromEnum(editorKey.HOME),
+                        'F' => @intFromEnum(editorKey.END),
+                        else => '\x1b',
+                    };
                 }
                 return '\x1b';
-            } else {
-                return c[0];
+            } else{
+                switch (c[0]) {
+                    '\r', '\n' => return @intFromEnum(editorKey.RETURN_KEY),
+                    else => return c[0],
+                }
             }
         }
     }
@@ -333,15 +399,31 @@ fn editorProcessKeypress() !bool {
     const c = try editorReadKey();
     if (c == ctrlKey('q')) return true;
     if (c == ctrlKey('l')) return true;
-    std.debug.print("Read key: {}\n", .{c});
-
+    if (c == ctrlKey('s')) {
+        try editorSave();
+        return false;
+    }
 
     switch (@as(editorKey, @enumFromInt(c))) {
         .ARROW_UP, .ARROW_DOWN, .ARROW_RIGHT, .ARROW_LEFT => |key| {
             editorMoveCursor(key);
         },
-        .BACKSPACE => {
+        .HOME => {
+            config.cx = 0;
+        },
+        .END => {
+            if(config.cy < config.numrows) {
+                config.cx = config.erows.items[config.cy].size;
+            }
+        },
+        .BACKSPACE, .DEL_KEY, .RETURN_KEY => {
             
+        },
+        .PAGE_UP, .PAGE_DOWN => |key| {
+            var times = config.screenrows;
+            while (times > 0) : (times -= 1) {
+                editorMoveCursor(if (key == .PAGE_UP) .ARROW_UP else .ARROW_DOWN);
+            }
         },
         else => {
             _ = try editorInsertChar(c);

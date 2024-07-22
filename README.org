@@ -1,3 +1,13 @@
 #+title: OSAKAEDIT
 
 A reimplementation of the kilo editor written in c.
+
+** TODOS:
+
+*** TODO Status Message bar 
+*** TODO Dirty flag
+*** TODO Quit confirmation
+*** TODO Simple backspacing 
+*** TODO Backspacing at the start of a line
+*** TODO Enter Key 
+*** TODO Save as 
