@@ -91,7 +91,9 @@ const EditorConfig = struct {
     numrows: usize,
     erows: std.ArrayList(ERow),
     filename: ?[]const u8,
-
+    statusmsg: ?[]const u8,
+    timestamp: i64,
+    
     pub fn init(alloc: Allocator) EditorConfig {
         return EditorConfig{
             .cx = 0,
@@ -105,7 +107,9 @@ const EditorConfig = struct {
             .abuf = ABuf.init(alloc),
             .numrows = 0,
             .erows = std.ArrayList(ERow).init(alloc),
-            .filename = undefined,
+            .filename = null,
+            .statusmsg = null,
+            .timestamp = 0,
         };
     }
 };
@@ -117,7 +121,7 @@ fn initEditor() !void {
     if (!try getWindowSize(&config.screenrows, &config.screencols)) {
         return error.WindowSizeError;
     }
-    config.screenrows -= 1;
+    config.screenrows -= 2;
 }
 
 fn enableRawMode() !void {
@@ -498,7 +502,7 @@ fn editorDrawStatusBar() !void {
     var rstatus: [80]u8 = undefined;
     const len = std.fmt.bufPrint(
         &status,
-        "{s:.20} - {} lines | kevin's a fatty btw",
+        "{s:.20} - {} lines |",
         .{
             if (config.filename) |f| f else "[No Name]",
             config.numrows
@@ -522,6 +526,18 @@ fn editorDrawStatusBar() !void {
         }
     }
     _ = try config.abuf.abAppend("\x1b[m");
+    _ = try config.abuf.abAppend("\r\n");
+}
+
+fn editorDrawMessageBar() !void {
+    try config.abuf.abAppend("\x1b[K");
+    
+    if (config.statusmsg) |msg| {
+        var len = @min(msg.len, config.screencols);
+        if (len > 0 and (std.time.milliTimestamp() - config.timestamp) < 5000) {
+            try config.abuf.abAppend(msg[0..len]);
+        }
+    }
 }
 
 fn editorRefreshScreen() !void {
@@ -532,6 +548,7 @@ fn editorRefreshScreen() !void {
 
     try editorDrawRows();
     try editorDrawStatusBar();
+    try editorDrawMessageBar();
 
     var buff: [32]u8 = undefined;
     const written = try std.fmt.bufPrint(
@@ -548,6 +565,19 @@ fn editorRefreshScreen() !void {
     config.abuf.abFree();
 }
 
+pub fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) void {
+    if (config.statusmsg) |msg| {
+        allocator.free(msg);
+    }
+
+    config.statusmsg = std.fmt.allocPrint(allocator, fmt, args) catch |err| {
+        std.debug.print("Failed to format status message: {}\n", .{err});
+        return;
+    };
+
+    config.timestamp = std.time.timestamp();
+}
+
 pub fn main() !void {
     var args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -556,6 +586,8 @@ pub fn main() !void {
         std.debug.print("Usage: {s} <filename>\n", .{args[0]});
         std.os.exit(1);
     }
+
+    editorSetStatusMessage("HELP: Ctrl-Q = quit", .{});
 
     try enableRawMode();
     defer disableRawMode();
